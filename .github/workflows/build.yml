@@ -1,0 +1,436 @@
+# Build workflow for public repo (oa-desktop-builds)
+# Triggered by repository_dispatch from private repo (oa-desktop)
+#
+# This workflow runs in a PUBLIC repo to use free GitHub Actions minutes,
+# while keeping the source code in a private repo.
+#
+# Required secrets (set in THIS public repo):
+#   GH_PAT                   - GitHub PAT with access to private repo + oa-fastchat submodule
+#   CLOUDFLARE_ACCOUNT_ID    - Cloudflare account ID
+#   CLOUDFLARE_R2_ACCESS_KEY - R2 access key ID
+#   CLOUDFLARE_R2_SECRET_KEY - R2 secret access key
+#
+# Optional (for signed + notarized macOS builds):
+#   APPLE_ID                 - Apple ID email
+#   APPLE_PASSWORD           - App-specific password (appleid.apple.com)
+#   APPLE_TEAM_ID            - Apple Developer Team ID
+#   MACOS_CERTIFICATE        - Base64-encoded .p12 certificate
+#   MACOS_CERTIFICATE_PWD    - Password for the .p12 certificate
+
+name: Build Release
+
+on:
+  repository_dispatch:
+    types: [build-release]
+
+env:
+  R2_BUCKET: oa-desktop-releases
+  R2_ENDPOINT: https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
+  # Private repo to checkout
+  PRIVATE_REPO: OpenAnonymity/oa-desktop
+
+jobs:
+  # =============================================================================
+  # macOS Builds (arm64 + x64)
+  # =============================================================================
+  build-macos:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-latest    # M1/M2 (arm64)
+            arch: arm64
+          - runner: macos-15-intel  # Intel (x64)
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Checkout private repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          ref: ${{ github.event.client_payload.ref }}
+          submodules: recursive
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Determine version
+        id: version
+        run: |
+          # Version is passed from private repo via client_payload
+          if [ -n "${{ github.event.client_payload.version }}" ]; then
+            VERSION="${{ github.event.client_payload.version }}"
+          else
+            VERSION=$(node -p "require('./package.json').version")
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION for ${{ matrix.arch }}"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check signing availability
+        id: signing
+        run: |
+          if [ -n "$APPLE_TEAM_ID" ]; then
+            echo "available=true" >> $GITHUB_OUTPUT
+          else
+            echo "available=false" >> $GITHUB_OUTPUT
+          fi
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Build app (unsigned)
+        if: steps.signing.outputs.available != 'true'
+        run: npm run make -- --arch=${{ matrix.arch }}
+        env:
+          OBFUSCATE: '1'
+
+      - name: Import code signing certificate
+        if: steps.signing.outputs.available == 'true'
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+        run: |
+          # Create temporary keychain
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+
+          # Decode certificate
+          echo $MACOS_CERTIFICATE | base64 --decode > $RUNNER_TEMP/certificate.p12
+
+          # Create and configure keychain
+          security create-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+          security default-keychain -s $KEYCHAIN_PATH
+          security set-keychain-settings -lut 21600 $KEYCHAIN_PATH
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+          # Import certificate
+          security import $RUNNER_TEMP/certificate.p12 -P "$MACOS_CERTIFICATE_PWD" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" $KEYCHAIN_PATH
+
+          # Add to search list (keep existing keychains)
+          security list-keychains -d user -s $KEYCHAIN_PATH $(security list-keychains -d user | tr -d '"')
+
+          # Verify certificate was imported
+          echo "Installed certificates:"
+          security find-identity -v -p codesigning
+
+          echo "Certificate imported successfully"
+
+      - name: Build app (signed + notarized)
+        if: steps.signing.outputs.available == 'true'
+        env:
+          OBFUSCATE: '1'
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npm run make -- --arch=${{ matrix.arch }}
+
+      - name: List build artifacts
+        run: |
+          echo "=== Build output for ${{ matrix.arch }} ==="
+          find out/make -type f \( -name "*.zip" -o -name "*.yml" -o -name "*.blockmap" -o -name "*.dmg" \) | head -20
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}-artifacts
+          path: |
+            out/make/zip/darwin/**/*.zip
+            out/make/zip/darwin/**/*.zip.blockmap
+            out/make/zip/darwin/**/latest-mac-arm64.yml
+            out/make/zip/darwin/**/latest-mac-x64.yml
+            out/make/*.dmg
+          if-no-files-found: error
+
+  # =============================================================================
+  # Windows Build (x64)
+  # =============================================================================
+  build-windows:
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Checkout private repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          ref: ${{ github.event.client_payload.ref }}
+          submodules: recursive
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.client_payload.version }}" ]; then
+            VERSION="${{ github.event.client_payload.version }}"
+          else
+            VERSION=$(node -p "require('./package.json').version")
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION for Windows"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build app
+        run: npm run make
+        env:
+          OBFUSCATE: '1'
+
+      - name: List build artifacts
+        shell: bash
+        run: |
+          echo "=== Build output for Windows ==="
+          find out/make -type f \( -name "*.exe" -o -name "*.nupkg" -o -name "*.msi" \) | head -20
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-artifacts
+          path: |
+            out/make/squirrel.windows/**/*.exe
+            out/make/squirrel.windows/**/*.nupkg
+          if-no-files-found: error
+
+  # =============================================================================
+  # Linux Build (x64)
+  # =============================================================================
+  build-linux:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Checkout private repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_REPO }}
+          ref: ${{ github.event.client_payload.ref }}
+          submodules: recursive
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ -n "${{ github.event.client_payload.version }}" ]; then
+            VERSION="${{ github.event.client_payload.version }}"
+          else
+            VERSION=$(node -p "require('./package.json').version")
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION for Linux"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dpkg fakeroot rpm
+
+      - name: Build app
+        run: npm run make
+        env:
+          OBFUSCATE: '1'
+
+      - name: List build artifacts
+        run: |
+          echo "=== Build output for Linux ==="
+          find out/make -type f \( -name "*.deb" -o -name "*.rpm" \) | head -20
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x64-artifacts
+          path: |
+            out/make/deb/**/*.deb
+            out/make/rpm/**/*.rpm
+          if-no-files-found: error
+
+  # =============================================================================
+  # Upload all artifacts to R2
+  # =============================================================================
+  upload-to-r2:
+    needs: [build-macos, build-windows, build-linux]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download macOS arm64 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-arm64-artifacts
+          path: artifacts/macos-arm64
+
+      - name: Download macOS x64 artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-x64-artifacts
+          path: artifacts/macos-x64
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-x64-artifacts
+          path: artifacts/windows
+
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-x64-artifacts
+          path: artifacts/linux
+
+      - name: List downloaded artifacts
+        run: |
+          echo "=== Downloaded artifacts ==="
+          find artifacts -type f
+
+      - name: Install rclone
+        run: |
+          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
+          sudo dpkg -i rclone-current-linux-amd64.deb
+
+      - name: Configure rclone for R2
+        run: |
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf << EOF
+          [r2]
+          type = s3
+          provider = Cloudflare
+          access_key_id = ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY }}
+          secret_access_key = ${{ secrets.CLOUDFLARE_R2_SECRET_KEY }}
+          endpoint = ${{ env.R2_ENDPOINT }}
+          acl = private
+          no_check_bucket = true
+          EOF
+
+      - name: Upload to R2
+        run: |
+          VERSION="${{ needs.build-macos.outputs.version }}"
+          echo "Uploading version $VERSION to R2..."
+
+          # =====================================================================
+          # macOS uploads (arm64 + x64)
+          # =====================================================================
+          echo ""
+          echo "Uploading macOS artifacts..."
+
+          # Upload update files for electron-updater
+          # arm64 generates latest-mac-arm64.yml, x64 generates latest-mac-x64.yml
+          find artifacts/macos-arm64 artifacts/macos-x64 \( -name "latest-mac-arm64.yml" -o -name "latest-mac-x64.yml" \) -exec rclone copy {} r2:${{ env.R2_BUCKET }}/ \;
+          find artifacts/macos-arm64 artifacts/macos-x64 -name "*.zip" -exec rclone copy {} r2:${{ env.R2_BUCKET }}/ \;
+          find artifacts/macos-arm64 artifacts/macos-x64 -name "*.zip.blockmap" -exec rclone copy {} r2:${{ env.R2_BUCKET }}/ \;
+
+          # Upload DMGs
+          find artifacts/macos-arm64 artifacts/macos-x64 -name "*.dmg" -exec rclone copy {} r2:${{ env.R2_BUCKET }}/ \;
+
+          # Copy DMGs to stable "latest" URLs (architecture-specific)
+          # Use while read to handle filenames with spaces
+          find artifacts/macos-arm64 artifacts/macos-x64 -name "*.dmg" -print0 | while IFS= read -r -d '' DMG_FILE; do
+            FILENAME=$(basename "$DMG_FILE")
+            # Extract arch from filename (e.g., "Open Anonymity-0.0.25-arm64.dmg" -> "arm64")
+            if [[ "$FILENAME" =~ -([^-]+)\.dmg$ ]]; then
+              ARCH="${BASH_REMATCH[1]}"
+              STABLE_NAME="Open-Anonymity-latest-mac-${ARCH}.dmg"
+              echo "  Copying $FILENAME -> $STABLE_NAME"
+              rclone copyto "$DMG_FILE" r2:${{ env.R2_BUCKET }}/$STABLE_NAME
+            fi
+          done
+
+          # =====================================================================
+          # Windows uploads
+          # =====================================================================
+          echo ""
+          echo "Uploading Windows artifacts..."
+
+          # Upload all Windows installers
+          find artifacts/windows -name "*.exe" -exec rclone copy {} r2:${{ env.R2_BUCKET }}/ \;
+
+          # Copy Setup.exe to stable "latest" URL
+          SETUP_EXE=$(find artifacts/windows -name "*Setup*.exe" | head -1)
+          if [ -n "$SETUP_EXE" ]; then
+            echo "  Copying $(basename "$SETUP_EXE") -> Open-Anonymity-latest-win-x64.exe"
+            rclone copyto "$SETUP_EXE" r2:${{ env.R2_BUCKET }}/Open-Anonymity-latest-win-x64.exe
+          fi
+
+          # =====================================================================
+          # Linux uploads
+          # =====================================================================
+          echo ""
+          echo "Uploading Linux artifacts..."
+
+          # Upload all Linux packages
+          find artifacts/linux -name "*.deb" -exec rclone copy {} r2:${{ env.R2_BUCKET }}/ \;
+          find artifacts/linux -name "*.rpm" -exec rclone copy {} r2:${{ env.R2_BUCKET }}/ \;
+
+          # Copy to stable "latest" URLs
+          DEB_FILE=$(find artifacts/linux -name "*.deb" | head -1)
+          if [ -n "$DEB_FILE" ]; then
+            echo "  Copying $(basename "$DEB_FILE") -> Open-Anonymity-latest-linux-x64.deb"
+            rclone copyto "$DEB_FILE" r2:${{ env.R2_BUCKET }}/Open-Anonymity-latest-linux-x64.deb
+          fi
+
+          RPM_FILE=$(find artifacts/linux -name "*.rpm" | head -1)
+          if [ -n "$RPM_FILE" ]; then
+            echo "  Copying $(basename "$RPM_FILE") -> Open-Anonymity-latest-linux-x64.rpm"
+            rclone copyto "$RPM_FILE" r2:${{ env.R2_BUCKET }}/Open-Anonymity-latest-linux-x64.rpm
+          fi
+
+          echo ""
+          echo "Upload complete!"
+
+      - name: Verify upload
+        run: |
+          echo "=== Files in R2 bucket ==="
+          rclone ls r2:${{ env.R2_BUCKET }}/ | head -30
+
+      - name: Print download URLs
+        run: |
+          echo ""
+          echo "============================================"
+          echo "  Release uploaded successfully!"
+          echo "============================================"
+          echo ""
+          echo "Update server URL: https://cdn.openanonymity.ai"
+          echo "Version: ${{ needs.build-macos.outputs.version }}"
+          echo ""
+          echo "Stable download links (always latest):"
+          echo ""
+          echo "  macOS (Apple Silicon): https://cdn.openanonymity.ai/Open-Anonymity-latest-mac-arm64.dmg"
+          echo "  macOS (Intel):         https://cdn.openanonymity.ai/Open-Anonymity-latest-mac-x64.dmg"
+          echo "  Windows (64-bit):      https://cdn.openanonymity.ai/Open-Anonymity-latest-win-x64.exe"
+          echo "  Linux (DEB):           https://cdn.openanonymity.ai/Open-Anonymity-latest-linux-x64.deb"
+          echo "  Linux (RPM):           https://cdn.openanonymity.ai/Open-Anonymity-latest-linux-x64.rpm"
+          echo ""
+          echo "macOS users will be notified of updates automatically."
+          echo ""
+
+      - name: Notify private repo of completion
+        if: always()
+        run: |
+          curl -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ secrets.GH_PAT }}" \
+            https://api.github.com/repos/${{ env.PRIVATE_REPO }}/dispatches \
+            -d '{"event_type":"build-complete","client_payload":{"version":"${{ needs.build-macos.outputs.version }}","status":"${{ job.status }}","run_id":"${{ github.run_id }}","run_url":"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"}}'
