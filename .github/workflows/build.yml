@@ -146,8 +146,7 @@ jobs:
           path: |
             out/make/zip/darwin/**/*.zip
             out/make/zip/darwin/**/*.zip.blockmap
-            out/make/zip/darwin/**/latest-mac-arm64.yml
-            out/make/zip/darwin/**/latest-mac-x64.yml
+            out/make/zip/darwin/**/latest-*-mac.yml
             out/make/*.dmg
           if-no-files-found: error
 
@@ -346,9 +345,24 @@ jobs:
           echo ""
           echo "Uploading macOS artifacts..."
 
-          # Upload update files for electron-updater
-          # arm64 generates latest-mac-arm64.yml, x64 generates latest-mac-x64.yml
-          find artifacts/macos-arm64 artifacts/macos-x64 \( -name "latest-mac-arm64.yml" -o -name "latest-mac-x64.yml" \) -exec rclone copy {} r2:${{ env.R2_BUCKET }}/ \;
+          # Upload update manifest files for electron-updater
+          # New naming: latest-arm64-mac.yml, latest-x64-mac.yml
+          find artifacts/macos-arm64 artifacts/macos-x64 -name "latest-*-mac.yml" -exec rclone copy {} r2:${{ env.R2_BUCKET }}/ \;
+
+          # Also create copies with OLD naming for backward compatibility with <= 0.0.35 clients
+          # Old clients look for: latest-mac-arm64-mac.yml, latest-mac-x64-mac.yml
+          ARM64_MANIFEST=$(find artifacts/macos-arm64 -name "latest-arm64-mac.yml" | head -1)
+          X64_MANIFEST=$(find artifacts/macos-x64 -name "latest-x64-mac.yml" | head -1)
+          if [ -n "$ARM64_MANIFEST" ]; then
+            echo "  Creating backward-compat copy: latest-mac-arm64-mac.yml"
+            rclone copyto "$ARM64_MANIFEST" r2:${{ env.R2_BUCKET }}/latest-mac-arm64-mac.yml
+          fi
+          if [ -n "$X64_MANIFEST" ]; then
+            echo "  Creating backward-compat copy: latest-mac-x64-mac.yml"
+            rclone copyto "$X64_MANIFEST" r2:${{ env.R2_BUCKET }}/latest-mac-x64-mac.yml
+          fi
+
+          # Upload ZIP files and blockmaps
           find artifacts/macos-arm64 artifacts/macos-x64 -name "*.zip" -exec rclone copy {} r2:${{ env.R2_BUCKET }}/ \;
           find artifacts/macos-arm64 artifacts/macos-x64 -name "*.zip.blockmap" -exec rclone copy {} r2:${{ env.R2_BUCKET }}/ \;
 
@@ -424,6 +438,12 @@ jobs:
           echo ""
           echo "Update server URL: https://cdn.openanonymity.ai"
           echo "Version: ${{ github.event.client_payload.version }}"
+          echo ""
+          echo "Auto-update manifests:"
+          echo "  - latest-arm64-mac.yml (new clients >= 0.0.36)"
+          echo "  - latest-x64-mac.yml (new clients >= 0.0.36)"
+          echo "  - latest-mac-arm64-mac.yml (old clients <= 0.0.35)"
+          echo "  - latest-mac-x64-mac.yml (old clients <= 0.0.35)"
           echo ""
           echo "Stable download links (always latest):"
           echo ""
